@@ -73,9 +73,12 @@ type Layer struct {
 
 // Attention implements Kolibri 1 attention with Q/K norms.
 type Attention struct {
-	QProj   nn.LinearLayer
-	KProj   nn.LinearLayer
-	VProj   nn.LinearLayer
+	QProj nn.LinearLayer
+	KProj nn.LinearLayer
+	VProj nn.LinearLayer
+	// QKV stacks the three projections when they share a format, so a step
+	// launches one matmul instead of three.
+	QKV     nn.LinearLayer
 	OProj   nn.LinearLayer
 	QNorm   *nn.RMSNorm
 	KNorm   *nn.RMSNorm
@@ -163,6 +166,9 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 	} else {
 		return fmt.Errorf("missing lm_head.weight")
 	}
+	if m.HeadDType == "float32" {
+		m.LMHead = newFloat32Head(m.LMHead)
+	}
 
 	for i := range m.NumHiddenLayers {
 		layerPrefix := fmt.Sprintf("model.layers.%d", i)
@@ -219,6 +225,12 @@ func (m *Model) LoadWeights(tensors map[string]*mlx.Array) error {
 		if layer.Attention.QNorm == nil || layer.Attention.KNorm == nil {
 			return fmt.Errorf("layer %d: missing attention q/k norms", i)
 		}
+		if qk, err := nn.StackLinears(layer.Attention.QProj, layer.Attention.KProj); err == nil {
+			if qkv, err := nn.StackLinears(qk, layer.Attention.VProj); err == nil {
+				layer.Attention.QKV = qkv
+				layer.Attention.QProj, layer.Attention.KProj, layer.Attention.VProj = nil, nil, nil
+			}
+		}
 
 		m.Layers[i] = layer
 	}
@@ -245,12 +257,56 @@ func (m *Model) Forward(b *batch.Batch, caches []cache.Cache) (hidden, auxHidden
 }
 
 func (m *Model) Unembed(x *mlx.Array) *mlx.Array {
-	if m.HeadDType == "float32" {
-		// Cast before projection so logits are never rounded through BF16,
-		// including when the head uses packed quantized weights.
-		x = x.AsType(mlx.DTypeFloat32)
-	}
 	return m.LMHead.Forward(x)
+}
+
+// float32Head produces float32 logits, so they are never rounded through
+// BF16. A dense head keeps its stored weights and accumulates them straight
+// into float32; matmul's type promotion would instead copy the whole
+// vocabulary matrix to float32 on every decode step. Quantized heads take
+// float32 activations, with affine scales and biases converted once at load.
+type float32Head struct {
+	Weight, Bias *mlx.Array
+	Quantized    nn.LinearLayer
+}
+
+func newFloat32Head(l nn.LinearLayer) nn.LinearLayer {
+	f32 := func(a *mlx.Array) *mlx.Array {
+		if a == nil || a.DType() == mlx.DTypeFloat32 {
+			return a
+		}
+		return a.AsType(mlx.DTypeFloat32)
+	}
+	switch h := l.(type) {
+	case *nn.Linear:
+		return &float32Head{Weight: h.Weight, Bias: f32(h.Bias)}
+	case *nn.QuantizedLinear:
+		if h.Mode == "affine" {
+			q := *h
+			q.Scales, q.QBiases, q.Bias = f32(h.Scales), f32(h.QBiases), f32(h.Bias)
+			h = &q
+		}
+		return &float32Head{Quantized: h}
+	}
+	return &float32Head{Quantized: l}
+}
+
+func (h *float32Head) Forward(x *mlx.Array) *mlx.Array {
+	if h.Weight == nil {
+		return h.Quantized.Forward(x.AsType(mlx.DTypeFloat32))
+	}
+	out := mlx.MatmulF32Out(x, h.Weight)
+	if h.Bias != nil {
+		out = mlx.Add(out, h.Bias)
+	}
+	return out
+}
+
+func (h *float32Head) OutputDim() int32 {
+	if h.Weight == nil {
+		return h.Quantized.OutputDim()
+	}
+	return int32(h.Weight.Dim(0))
 }
 
 func (m *Model) MaxContextLength() int {
@@ -281,13 +337,18 @@ func (l *Layer) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positions *
 }
 
 func (a *Attention) Forward(x *mlx.Array, b *batch.Batch, c cache.Cache, positions *mlx.Array, B, L int32, cfg *Config) *mlx.Array {
-	q := a.QProj.Forward(x)
-	k := a.KProj.Forward(x)
-	v := a.VProj.Forward(x)
-
-	q = mlx.Reshape(q, B, L, cfg.NumAttentionHeads, cfg.HeadDim)
-	k = mlx.Reshape(k, B, L, cfg.NumKeyValueHeads, cfg.HeadDim)
-	v = mlx.Reshape(v, B, L, cfg.NumKeyValueHeads, cfg.HeadDim)
+	var q, k, v *mlx.Array
+	if a.QKV != nil {
+		nh, nkv := int(cfg.NumAttentionHeads), int(cfg.NumKeyValueHeads)
+		qkv := mlx.Reshape(a.QKV.Forward(x), B, L, int32(nh+2*nkv), cfg.HeadDim)
+		q = qkv.Slice(mlx.Slice(), mlx.Slice(), mlx.Slice(0, nh), mlx.Slice())
+		k = qkv.Slice(mlx.Slice(), mlx.Slice(), mlx.Slice(nh, nh+nkv), mlx.Slice())
+		v = qkv.Slice(mlx.Slice(), mlx.Slice(), mlx.Slice(nh+nkv, nh+2*nkv), mlx.Slice())
+	} else {
+		q = mlx.Reshape(a.QProj.Forward(x), B, L, cfg.NumAttentionHeads, cfg.HeadDim)
+		k = mlx.Reshape(a.KProj.Forward(x), B, L, cfg.NumKeyValueHeads, cfg.HeadDim)
+		v = mlx.Reshape(a.VProj.Forward(x), B, L, cfg.NumKeyValueHeads, cfg.HeadDim)
+	}
 
 	q = a.QNorm.Forward(q, cfg.RMSNormEps)
 	k = a.KNorm.Forward(k, cfg.RMSNormEps)

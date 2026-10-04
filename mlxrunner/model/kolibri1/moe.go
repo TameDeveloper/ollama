@@ -47,7 +47,6 @@ func loadMoE(tensors map[string]*mlx.Array, linears model.LinearFactory, prefix 
 	if m.Router.NumDims() != 2 || m.Router.Dim(0) != int(cfg.NumExperts) || m.Router.Dim(1) != int(cfg.HiddenSize) || m.ExpertBias.Size() != int(cfg.NumExperts) {
 		return nil, fmt.Errorf("invalid router shape")
 	}
-	m.Router = m.Router.AsType(mlx.DTypeFloat32)
 	m.ExpertBias = m.ExpertBias.AsType(mlx.DTypeFloat32)
 	var err error
 	for _, p := range []struct {
@@ -107,7 +106,7 @@ func (e *ExpertLinear) Forward(x, indices *mlx.Array, sorted bool) *mlx.Array {
 }
 
 func (m *MoE) route(x *mlx.Array, cfg *Config) (indices, scores *mlx.Array) {
-	logits := mlx.Matmul(x.AsType(mlx.DTypeFloat32), mlx.Transpose(m.Router, 1, 0))
+	logits := mlx.MatmulF32Out(x, m.Router)
 	indices = mlx.Argpartition(mlx.Neg(mlx.Add(logits, m.ExpertBias)), int(cfg.NumExpertsPerTok)-1, -1)
 	indices = indices.Slice(mlx.Slice(), mlx.Slice(), mlx.Slice(0, int(cfg.NumExpertsPerTok)))
 	scores = mlx.Sigmoid(mlx.TakeAlongAxis(logits, indices, -1))
@@ -154,6 +153,17 @@ func (m *MoE) Forward(x *mlx.Array, cfg *Config) *mlx.Array {
 		y = mlx.Take(mlx.Reshape(y, B*L*cfg.NumExpertsPerTok, cfg.HiddenSize), inverse, 0)
 	}
 	y = mlx.Reshape(y, B, L, cfg.NumExpertsPerTok, cfg.HiddenSize)
-	y = mlx.Sum(mlx.Mul(y.AsType(mlx.DTypeFloat32), mlx.ExpandDims(scores, -1)), 2, false).AsType(x.DType())
-	return mlx.Add(y, m.Shared.Forward(x))
+	return moeCombine(y, scores, m.Shared.Forward(x))[0]
 }
+
+// moeCombine mixes the routed experts with float32 weights and accumulation,
+// as the reference does, and adds the shared expert in one compiled graph
+// instead of materializing a float32 copy of every expert output.
+var moeCombine = mlx.Compile(
+	"Kolibri1MoECombine",
+	func(in ...*mlx.Array) []*mlx.Array {
+		y, scores, shared := in[0], in[1], in[2]
+		y = mlx.Sum(mlx.Mul(y.AsType(mlx.DTypeFloat32), mlx.ExpandDims(scores, -1)), 2, false)
+		return []*mlx.Array{mlx.Add(y.AsType(shared.DType()), shared)}
+	},
+)

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"os"
 	"strings"
 	"testing"
 
@@ -40,10 +41,17 @@ func TestConfig(t *testing.T) {
 	}
 }
 
+func TestMain(m *testing.M) {
+	// The reference logits are exact float32. M5 GPUs otherwise run float32
+	// matmuls as TF32, far outside the tolerances below.
+	os.Setenv("MLX_ENABLE_TF32", "0")
+	os.Exit(m.Run())
+}
+
 func TestUnembedHeadDType(t *testing.T) {
-	for _, quantized := range []bool{false, true} {
+	for _, head := range []string{"bf16", "mxfp8", "affine"} {
 		for _, headDType := range []string{"", "float32"} {
-			mlxtest.RunSubtest(t, fmt.Sprintf("quantized=%t/head_dtype=%s", quantized, headDType), func(t *mlxtest.T) {
+			mlxtest.RunSubtest(t, fmt.Sprintf("head=%s/head_dtype=%s", head, headDType), func(t *mlxtest.T) {
 				cfg, err := parseConfig([]byte(strings.Replace(tinyConfig, "{", fmt.Sprintf(`{"head_dtype":%q,`, headDType), 1)))
 				if err != nil {
 					t.Fatal(err)
@@ -54,9 +62,29 @@ func TestUnembedHeadDType(t *testing.T) {
 				}
 				w := mlx.FromValues(weights, 32, 32).AsType(mlx.DTypeBFloat16)
 				m := &Model{Config: &cfg, LMHead: nn.NewLinear(w, nil)}
-				if quantized {
+				switch head {
+				case "mxfp8":
 					// The NVFP4 import policy uses MXFP8 for the output head.
 					m.LMHead = nn.NewQuantizedLinear(w, nil, 32, 8, "mxfp8")
+				case "affine":
+					// int4/int8 imports use 8-bit affine heads.
+					m.LMHead = nn.NewQuantizedLinear(w, nil, 32, 8, "affine")
+				}
+				if headDType == "float32" {
+					m.LMHead = newFloat32Head(m.LMHead)
+					h := m.LMHead.(*float32Head)
+					switch head {
+					case "bf16":
+						// Read at its stored width, never copied to float32.
+						if h.Weight == nil || h.Weight.DType() != mlx.DTypeBFloat16 {
+							t.Fatalf("dense head weight %v", h.Weight)
+						}
+					case "affine":
+						q := h.Quantized.(*nn.QuantizedLinear)
+						if q.Scales.DType() != mlx.DTypeFloat32 || q.QBiases.DType() != mlx.DTypeFloat32 {
+							t.Fatalf("affine head scales stay %v", q.Scales.DType())
+						}
+					}
 				}
 				values := make([]float32, 32)
 				values[0], values[1] = 1, 1.0/512
@@ -175,6 +203,12 @@ func assertClose(t *mlxtest.T, got, want []float32, tol float64) {
 func TestReferenceAndCache(t *testing.T) {
 	mlxtest.Run(t, func(t *mlxtest.T) {
 		m := tinyModel(t, false)
+		for i, l := range m.Layers {
+			// The reference below covers the stacked q/k/v projection.
+			if l.Attention.QKV == nil || l.Attention.QProj != nil {
+				t.Fatalf("layer %d: q/k/v not stacked", i)
+			}
+		}
 		tokens := []int32{1, 4, 2, 7, 3}
 		b := &batch.Batch{InputIDs: mlx.FromValues(tokens, 1, 5), SeqOffsets: []int32{0}, SeqQueryLens: []int32{5}}
 		h, _ := m.Forward(b, nil)
@@ -231,6 +265,18 @@ func TestRouterBiasSelectsWithoutReweighting(t *testing.T) {
 			if math.Abs(float64(values[j])-1/(1+math.Exp(-logit))) > 1e-6 {
 				t.Fatal("bias changed mixture weight")
 			}
+		}
+		// Selection adds the bias to the logits, not to their sigmoid: with
+		// logits [4, 0] and bias [-3, 0], 4-3 > 0 picks expert 0, while
+		// sigmoid(4)-3 < sigmoid(0) would pick expert 1.
+		m = &MoE{Router: mlx.FromValues([]float32{4, 0}, 2, 1), ExpertBias: mlx.FromValues([]float32{-3, 0}, 2)}
+		ids, scores = m.route(mlx.FromValues([]float32{1}, 1, 1, 1), &Config{NumExpertsPerTok: 1})
+		mlx.Eval(ids, scores)
+		if got := ids.AsType(mlx.DTypeInt32).Ints(); got[0] != 0 {
+			t.Fatalf("selected expert %d, want 0", got[0])
+		}
+		if got := scores.Floats(); math.Abs(float64(got[0])-1/(1+math.Exp(-4))) > 1e-6 {
+			t.Fatalf("mixture weight %g, want sigmoid(4)", got[0])
 		}
 	})
 }
