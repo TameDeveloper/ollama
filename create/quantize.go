@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -185,11 +186,23 @@ func loadAndQuantizeArray(r io.Reader, name, quantize string, decodeFP8 bool, ar
 
 		groupSize, bits, mode := quant.Params(quantize)
 		var globalScale *mlx.Array
-		if mode == "nvfp4" {
-			// Without normalization, small weights can round every E4M3 block
-			// scale to zero. A zero tensor uses the identity scale instead.
+		// Without normalization, small weights can round every E4M3 block
+		// scale to zero. Float16 sources keep float16 activations, where the
+		// normalized matmul output would overflow before its global scale is
+		// applied, so they stay unnormalized.
+		if mode == "nvfp4" && arr.DType() != mlx.DTypeFloat16 {
 			amax := mlx.Flatten(arr.Abs()).MaxAxis(0, false).AsType(mlx.DTypeFloat32)
-			globalScale = mlx.Where(amax.Equal(mlx.FromValue(float32(0))), mlx.FromValue(float32(mlx.Nvfp4MaxProduct)), amax)
+			switch v := float64(amax.Float()); {
+			case math.IsNaN(v) || math.IsInf(v, 0):
+				// One non-finite weight would poison every block's scale.
+				err = fmt.Errorf("tensor %s has non-finite values and cannot be quantized to %s", name, quantize)
+				return nil
+			case v == 0:
+				// A zero tensor uses the identity scale.
+				globalScale = mlx.FromValue(float32(mlx.Nvfp4MaxProduct))
+			default:
+				globalScale = amax
+			}
 		}
 		qweight, scales, qbiases := mlx.QuantizeWithGlobalScale(arr, groupSize, bits, mode, globalScale)
 		if len(qweight.Dims()) == 0 || qweight.Dims()[0] == 0 {

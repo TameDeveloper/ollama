@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 
 	st "github.com/ollama/ollama/fs/safetensors"
@@ -243,6 +244,53 @@ func TestNVFP4SmallWeights(t *testing.T) {
 		})
 		if err != nil {
 			t.Fatal(err)
+		}
+	}
+}
+
+// encodeFloat16s truncates to IEEE half precision, flushing values below its
+// normal range to zero; enough for test weights.
+func encodeFloat16s(vals ...float32) []byte {
+	raw := make([]byte, 2*len(vals))
+	for i, v := range vals {
+		b := math.Float32bits(v)
+		h := uint16(b>>16) & 0x8000
+		if exp := int(b>>23&0xff) - 127 + 15; exp > 0 {
+			h |= uint16(exp)<<10 | uint16(b&0x7fffff>>13)
+		}
+		binary.LittleEndian.PutUint16(raw[2*i:], h)
+	}
+	return raw
+}
+
+func TestNVFP4Float16Unnormalized(t *testing.T) {
+	mlxtest.SkipIfUnavailable(t)
+	values := make([]float32, 2*32*32)
+	for i := range values {
+		values[i] = 0.05 * float32(math.Sin(float64(i)*0.17))
+	}
+	tensor := st.NewTensorDataFromBytes("linear.weight", "F16", []int32{2, 32, 32}, encodeFloat16s(values...))
+	blob, err := quantizeBlob(context.Background(), []quantizeItem{{name: tensor.Name, quantize: "nvfp4", reader: st.BuildPackedSafetensorsReader([]*st.TensorData{tensor})}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := blobHeader(t, blob)["linear.weight.global_scale"]; ok {
+		t.Fatal("float16 source stored a global scale; its activations would overflow")
+	}
+}
+
+func TestNVFP4RejectsNonFinite(t *testing.T) {
+	mlxtest.SkipIfUnavailable(t)
+	for _, bad := range []float32{float32(math.NaN()), float32(math.Inf(1))} {
+		values := make([]float32, 2*32*32)
+		for i := range values {
+			values[i] = 0.05 * float32(math.Sin(float64(i)*0.17))
+		}
+		values[100] = bad
+		tensor := st.NewTensorDataFromBytes("linear.weight", "F32", []int32{2, 32, 32}, encodeFloat32s(values...))
+		_, err := quantizeBlob(context.Background(), []quantizeItem{{name: tensor.Name, quantize: "nvfp4", reader: st.BuildPackedSafetensorsReader([]*st.TensorData{tensor})}})
+		if err == nil || !strings.Contains(err.Error(), "linear.weight") {
+			t.Fatalf("%g: got %v, want an error naming the tensor", bad, err)
 		}
 	}
 }
