@@ -41,7 +41,7 @@ func (*Kolibri1Renderer) Render(messages []api.Message, tools []api.Tool, think 
 	if len(tools) > 0 {
 		out.WriteString("\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>")
 		for _, tool := range tools {
-			data, err := marshalWithSpaces(tool)
+			data, err := marshalWithSpacesNoHTMLEscape(tool)
 			if err != nil {
 				return "", fmt.Errorf("kolibri1 tool schema: %w", err)
 			}
@@ -91,7 +91,7 @@ func (*Kolibri1Renderer) Render(messages []api.Message, tools []api.Tool, think 
 				if j > 0 || content != "" {
 					out.WriteByte('\n')
 				}
-				data, err := marshalWithSpaces(struct {
+				data, err := marshalWithSpacesNoHTMLEscape(struct {
 					Name      string                        `json:"name"`
 					Arguments api.ToolCallFunctionArguments `json:"arguments"`
 				}{call.Function.Name, call.Function.Arguments})
@@ -102,7 +102,8 @@ func (*Kolibri1Renderer) Render(messages []api.Message, tools []api.Tool, think 
 				out.Write(data)
 				out.WriteString("\n</tool_call>")
 			}
-			prefill = i == len(messages)-1 && len(m.ToolCalls) == 0
+			// An empty final assistant message is a placeholder, not a prefill.
+			prefill = i == len(messages)-1 && m.Content != "" && len(m.ToolCalls) == 0
 			if !prefill {
 				out.WriteString(imEndTag + "\n")
 			}

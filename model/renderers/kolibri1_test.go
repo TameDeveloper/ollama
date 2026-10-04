@@ -11,7 +11,8 @@ import (
 )
 
 // Frozen outputs of Kolibri-1's upstream Jinja template at
-// e52eb4627d11516b0c01de49210ab5a4e4061444.
+// e52eb4627d11516b0c01de49210ab5a4e4061444. Think is resolved as the server
+// resolves it; a think name is the template's reasoning_effort.
 func TestKolibri1TemplateParity(t *testing.T) {
 	data, err := os.ReadFile("testdata/kolibri1_render_cases.json")
 	if err != nil {
@@ -29,7 +30,8 @@ func TestKolibri1TemplateParity(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.Name, func(t *testing.T) {
-			got, err := RenderWithRenderer("kolibri1", tc.Messages, tc.Tools, tc.Think)
+			think := ResolveThinking(tc.Think, ThinkingForRenderer("kolibri1"))
+			got, err := RenderWithRenderer("kolibri1", tc.Messages, tc.Tools, think)
 			if err != nil {
 				t.Fatal(err)
 			}
